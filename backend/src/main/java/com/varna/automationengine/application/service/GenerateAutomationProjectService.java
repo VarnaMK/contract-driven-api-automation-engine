@@ -3,6 +3,7 @@ package com.varna.automationengine.application.service;
 import com.varna.automationengine.application.usecase.GenerateAutomationProjectUseCase;
 import com.varna.automationengine.domain.exception.ContractParseException;
 import com.varna.automationengine.domain.exception.ProjectGenerationException;
+import com.varna.automationengine.domain.exception.TemplateRenderException;
 import com.varna.automationengine.domain.model.contract.ApiContract;
 import com.varna.automationengine.domain.model.project.GeneratedProject;
 import com.varna.automationengine.infrastructure.generator.ProjectGenerator;
@@ -14,41 +15,80 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 /**
- * Concrete implementation of {@link GenerateAutomationProjectUseCase}.
+ * Orchestrates the full API automation project generation pipeline.
  *
- * <p><b>Responsibility of this class:</b><br>
- * This service owns the <em>orchestration</em> of the generation pipeline.
- * It does NOT do the actual parsing, generating, or zipping itself — it
- * delegates each step to a specialist component (parser, generator, archiver).
- * Its only job is to call those components in the right order, pass data
- * between them, and handle any errors that arise.
+ * <p>This class is the <b>application layer</b> of the system — it sits between
+ * the HTTP controller (which handles requests) and the infrastructure components
+ * (which do the real work). Its only job is to call the right components in the
+ * right order and return the result.
  *
- * <p><b>Why is this in the {@code application.service} package, not {@code application.usecase}?</b><br>
- * Following the principle of separating interface from implementation:
+ * <p><b>Complete pipeline this class drives:</b>
+ * <pre>
+ *
+ *  [HTTP Controller]
+ *        │  MultipartFile (uploaded .yaml / .json spec)
+ *        │  traceId       (unique request ID for log correlation)
+ *        ▼
+ *  ┌─────────────────────────────────────────────────────────────┐
+ *  │         GenerateAutomationProjectService  (THIS CLASS)      │
+ *  │                                                             │
+ *  │  Stage 1 ──► OpenApiParser.parse()                         │
+ *  │               │  reads file bytes                          │
+ *  │               │  extracts endpoints, schemas, metadata     │
+ *  │               ▼                                             │
+ *  │           ApiContract  ◄── domain model hand-off point     │
+ *  │               │                                             │
+ *  │  Stage 2 ──► ProjectGenerator.generate()                   │
+ *  │               │  renders pom.xml          via Mustache     │
+ *  │               │  renders testng.xml        via Mustache    │
+ *  │               │  renders BaseTest.java      via Mustache   │
+ *  │               │  renders POJO classes       via Mustache   │
+ *  │               │  renders test classes       via Mustache   │
+ *  │               ▼                                             │
+ *  │           GeneratedProject  (list of GeneratedFile objects) │
+ *  │               │                                             │
+ *  │  Stage 3 ──► ZipUtility.zip()                              │
+ *  │               │  writes each file into ZipOutputStream     │
+ *  │               │  entirely in memory — no temp files        │
+ *  │               ▼                                             │
+ *  │           byte[]  (complete ZIP archive)                    │
+ *  └─────────────────────────────────────────────────────────────┘
+ *        │
+ *        ▼
+ *  [HTTP Controller]  → HTTP 200 + Content-Disposition: attachment
+ *
+ * </pre>
+ *
+ * <p><b>Exception propagation — what each exception means and where it is handled:</b>
  * <ul>
- *   <li>{@code application.usecase} — contains interfaces (the "what")</li>
- *   <li>{@code application.service} — contains implementations (the "how")</li>
+ *   <li>{@link ContractParseException} — thrown by Stage 1 (parser) when the file is not
+ *       valid OpenAPI. Caught by the controller → HTTP 422 Unprocessable Entity.</li>
+ *   <li>{@link TemplateRenderException} — thrown by Stage 2 (generator) when a
+ *       Mustache template file is missing or has a syntax error. Caught by the
+ *       controller → HTTP 500 Internal Server Error.</li>
+ *   <li>{@link ProjectGenerationException} — thrown by Stage 2 or Stage 3 when
+ *       no files are produced or the ZIP stream fails. Caught by the
+ *       controller → HTTP 500 Internal Server Error.</li>
  * </ul>
- * This keeps the packages clean and makes it immediately obvious which classes
- * define contracts vs. which classes fulfil them.
+ * This class does NOT catch any of these exceptions. Letting them propagate keeps
+ * the error message precise and avoids wrapping context that is already set at source.
  *
- * <p><b>The {@code @Service} annotation:</b><br>
- * This is a Spring stereotype annotation. It tells Spring to automatically
- * detect this class during startup (via component scanning) and register it
- * as a bean in the application context. Because this class implements
- * {@link GenerateAutomationProjectUseCase}, Spring will inject it wherever
- * that interface is declared as a dependency (e.g. in the controller).
+ * <p><b>Spring annotation: {@code @Service}</b><br>
+ * Marks this class as a Spring-managed bean (singleton by default). Spring auto-detects
+ * it at startup via component scanning and registers it in the application context.
+ * Because this class implements {@link GenerateAutomationProjectUseCase}, Spring injects
+ * it automatically into {@code ProjectGeneratorController} without any extra wiring config.
  *
- * <p><b>Architecture note:</b><br>
- * This class sits in the {@code application} layer. It is allowed to:
+ * <p><b>Architecture rules for this class:</b>
  * <ul>
- *   <li>Import and use domain models and exceptions</li>
- *   <li>Import Spring framework annotations ({@code @Service})</li>
- *   <li>Depend on infrastructure via interfaces (ports) — NOT concrete adapters</li>
+ *   <li>✅ MAY use domain models ({@code ApiContract}, {@code GeneratedProject})</li>
+ *   <li>✅ MAY use domain exceptions ({@code ContractParseException}, etc.)</li>
+ *   <li>✅ MAY depend on infrastructure INTERFACES ({@code OpenApiParser}, {@code ProjectGenerator})</li>
+ *   <li>✅ MAY use Spring annotations ({@code @Service})</li>
+ *   <li>❌ MUST NOT import concrete infrastructure classes ({@code SwaggerOpenApiParser}, etc.)</li>
+ *   <li>❌ MUST NOT contain HTTP concepts ({@code ResponseEntity}, status codes, headers)</li>
+ *   <li>❌ MUST NOT contain template or ZIP logic — those live in infrastructure</li>
  * </ul>
- * It must NEVER directly import or instantiate infrastructure classes
- * (e.g. {@code OpenApiParserAdapter}, {@code FreemarkerTemplateRenderer}).
- * Those are injected via their port interfaces.
  */
 @Service
 public class GenerateAutomationProjectService implements GenerateAutomationProjectUseCase {
@@ -56,113 +96,224 @@ public class GenerateAutomationProjectService implements GenerateAutomationProje
     private static final Logger log = LoggerFactory.getLogger(GenerateAutomationProjectService.class);
 
     // ─────────────────────────────────────────────────────────────────────────
-    // DEPENDENCIES (ports — interfaces that infrastructure will implement)
+    // DEPENDENCIES — all typed to INTERFACES, declared final
     //
-    // These fields are currently commented out because the port interfaces and
-    // their infrastructure implementations do not exist yet. They are declared
-    // here as a clear blueprint of what this service will need.
+    // Typed to interfaces (not concrete classes) so that:
+    //   1. This class is decoupled from the implementation details of each layer
+    //   2. Spring can inject any bean that implements the interface
+    //   3. Unit tests can inject mocks or fakes without needing Spring at all
     //
-    // When each layer is generated, you will:
-    //   1. Uncomment the field
-    //   2. Add it as a constructor parameter
-    //   3. Remove the corresponding TODO stub in the execute() method
-    //
-    // Each dependency is an INTERFACE (port), not a concrete class.
-    // Spring will inject the correct implementation at runtime automatically.
+    // Declared final so that:
+    //   1. They can only ever be assigned once — in the constructor below
+    //   2. The compiler prevents accidental reassignment later in the class
+    //   3. The object is effectively immutable after construction
     // ─────────────────────────────────────────────────────────────────────────
 
+    /**
+     * Parses an uploaded OpenAPI spec file into an {@link ApiContract} domain model.
+     * Spring injects: {@code SwaggerOpenApiParser} (infrastructure layer).
+     */
     private final OpenApiParser contractParser;
-    private final ProjectGenerator projectGenerator;
-    private final ZipUtility zipUtility;
 
     /**
-     * Constructor injection — the only constructor in this class.
-     *
-     * <p><b>Why constructor injection?</b><br>
-     * Constructor injection is the recommended approach in Spring Boot for three reasons:
-     * <ol>
-     *   <li><b>Explicit dependencies</b> — you can see exactly what this class needs
-     *       to function just by reading the constructor signature</li>
-     *   <li><b>Immutability</b> — fields can be declared {@code final}, meaning they
-     *       can never be accidentally reassigned after construction</li>
-     *   <li><b>Testability</b> — in unit tests you can instantiate this class with
-     *       mock dependencies directly, no Spring context needed</li>
-     * </ol>
-     *
-     * <p>When {@code @Service} is present and a class has exactly ONE constructor,
-     * Spring automatically uses that constructor for injection — no {@code @Autowired}
-     * annotation is required on the constructor (Spring Boot 2.x and above).
-     *
-     * <p>TODO: As port interfaces are added, include them as parameters here.
+     * Generates all REST Assured project source files from an {@link ApiContract}.
+     * Spring injects: {@code RestAssuredProjectGenerator} (infrastructure layer).
      */
-    public GenerateAutomationProjectService(OpenApiParser contractParser,
-                                            ProjectGenerator projectGenerator,
-                                            ZipUtility zipUtility) {
+    private final ProjectGenerator projectGenerator;
+
+    /**
+     * Packages a {@link GeneratedProject} into a ZIP archive and returns raw bytes.
+     * Spring injects: {@code ZipUtility} (infrastructure layer).
+     */
+    private final ZipUtility zipUtility;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CONSTRUCTOR — the ONLY place dependencies are assigned
+    //
+    // WHY CONSTRUCTOR INJECTION (not @Autowired field injection)?
+    //
+    //   @Autowired on a field:          Constructor injection (this approach):
+    //   ──────────────────────          ────────────────────────────────────────
+    //   Hidden — not obvious what       Explicit — constructor signature shows
+    //   the class depends on            exactly what the class needs to work
+    //
+    //   Fields cannot be final          Fields CAN be final → immutability
+    //
+    //   Need Spring context to test     Can test with: new Service(mockA, mockB, mockC)
+    //
+    //   Circular deps fail at runtime   Circular deps caught at Spring startup
+    //
+    // Spring Boot 2.x+ rule:
+    //   When a class has exactly ONE constructor, Spring uses it automatically.
+    //   You do NOT need to write @Autowired on the constructor.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Constructs the service with all required dependencies injected by Spring.
+     *
+     * <p>Spring resolves each parameter by finding a bean in the application context
+     * that implements the declared interface type:
+     * <ul>
+     *   <li>{@code OpenApiParser}    → finds {@code SwaggerOpenApiParser} ({@code @Component})</li>
+     *   <li>{@code ProjectGenerator} → finds {@code RestAssuredProjectGenerator} ({@code @Component})</li>
+     *   <li>{@code ZipUtility}       → finds {@code ZipUtility} ({@code @Component})</li>
+     * </ul>
+     *
+     * @param contractParser   parses uploaded OpenAPI files into domain models
+     * @param projectGenerator generates all source files from a parsed contract
+     * @param zipUtility       packages generated files into a ZIP byte array
+     */
+    public GenerateAutomationProjectService(final OpenApiParser contractParser,
+                                            final ProjectGenerator projectGenerator,
+                                            final ZipUtility zipUtility) {
         this.contractParser   = contractParser;
         this.projectGenerator = projectGenerator;
         this.zipUtility       = zipUtility;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // USE CASE IMPLEMENTATION
+    // USE CASE ENTRY POINT — called by the controller
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * {@inheritDoc}
+     * Executes the full three-stage project generation pipeline.
      *
-     * <p><b>Current state:</b> Stubbed. Each stage of the pipeline is marked
-     * with a TODO and returns a placeholder result. The orchestration structure
-     * (sequence of steps, logging, error handling) is fully in place and ready
-     * for real implementations to be plugged in.
+     * <p>Delegates each stage to a dedicated infrastructure component. This method
+     * contains zero business logic of its own — it is a pure orchestrator.
+     * Exceptions from any stage are not caught here; they propagate directly
+     * to the controller which maps them to appropriate HTTP responses.
      *
-     * <p><b>Full pipeline (once all layers are implemented):</b>
-     * <pre>
-     *   Stage 1 — Read file bytes from MultipartFile
-     *       ↓
-     *   Stage 2 — Parse bytes into ApiContract domain model  [ContractParserPort]
-     *       ↓
-     *   Stage 3 — Generate project files from ApiContract    [ProjectGeneratorPort]
-     *       ↓
-     *   Stage 4 — Zip all generated files into a byte[]      [ArchivePort]
-     *       ↓
-     *   Return byte[] to controller
-     * </pre>
+     * @param contractFile the uploaded OpenAPI specification file (.yaml, .yml, or .json);
+     *                     guaranteed non-null and non-empty — validated by the controller
+     *                     before this method is called
+     * @param traceId      a UUID string unique to this HTTP request; pass this to every
+     *                     downstream component so all log lines for this request share it
+     * @return the generated REST Assured project as a complete ZIP archive in raw bytes,
+     *         ready to be written into the HTTP response body by the controller
+     * @throws ContractParseException     if Stage 1 fails (invalid or unrecognisable spec)
+     * @throws TemplateRenderException    if Stage 2 fails (template missing or broken)
+     * @throws ProjectGenerationException if Stage 2 or Stage 3 fails (no files, ZIP error)
      */
     @Override
     public byte[] execute(MultipartFile contractFile, String traceId) {
 
-        log.info("[traceId={}] GenerateAutomationProjectService.execute() started | filename={}",
-                traceId, contractFile.getOriginalFilename());
+        log.info("[traceId={}] ═══ Pipeline START | file='{}' | size={} bytes ═══",
+                traceId,
+                contractFile.getOriginalFilename(),
+                contractFile.getSize());
 
-        // ── Stage 1 + 2: Parse the uploaded file into an ApiContract domain model ───
+        // ═════════════════════════════════════════════════════════════════════
+        // STAGE 1 — PARSE
         //
-        // The OpenApiParser (implemented by SwaggerOpenApiParser) handles both
-        // reading the raw bytes AND converting the spec content into the ApiContract.
-        // It throws ContractParseException on any failure — the controller maps
-        // that to HTTP 422 Unprocessable Entity.
+        // INPUT:  MultipartFile  (raw bytes of the uploaded spec file)
+        // OUTPUT: ApiContract    (structured domain model)
+        //
+        // What SwaggerOpenApiParser does internally:
+        //   1. Reads the file bytes as a UTF-8 string
+        //   2. Feeds them to OpenAPIV3Parser (Swagger library)
+        //   3. Resolves all $ref references (setResolveFully = true)
+        //   4. Validates: info section present, at least one path defined
+        //   5. Maps every path+method combination to an ApiEndpoint object
+        //   6. Maps every components/schema to an ApiSchema object
+        //   7. Wraps everything in an ApiContract and returns it
+        //
+        // If anything in steps 1–7 fails, SwaggerOpenApiParser throws
+        // ContractParseException — the controller maps that to HTTP 422.
+        // ═════════════════════════════════════════════════════════════════════
+
+        log.info("[traceId={}] ─── Stage 1: Parsing OpenAPI contract ───", traceId);
+
         ApiContract contract = contractParser.parse(contractFile, traceId);
 
-        log.info("[traceId={}] Contract parsed successfully | {}", traceId, contract);
+        //  contract now contains:
+        //  ┌─────────────────────────────────────────────────────────────────┐
+        //  │  contract.getTitle()       "Pet Store API"                       │
+        //  │  contract.getVersion()     "1.0.0"                               │
+        //  │  contract.getBaseUrl()     "https://petstore.example.com/v3"     │
+        //  │  contract.getEndpoints()   [GET /pets, POST /pets, GET /pets/{id}]│
+        //  │  contract.getSchemas()     {Pet: ApiSchema, Error: ApiSchema}     │
+        //  └─────────────────────────────────────────────────────────────────┘
+        log.info("[traceId={}] ─── Stage 1 DONE | {}", traceId, contract);
 
-        // ── Stage 3: Generate all project source files from the parsed contract ─────
+
+        // ═════════════════════════════════════════════════════════════════════
+        // STAGE 2 — GENERATE
         //
-        // RestAssuredProjectGenerator fans out to produce pom.xml, testng.xml,
-        // BaseTest.java, POJO classes, and one test class per resource group.
-        // Throws ProjectGenerationException if generation fails.
-        log.info("[traceId={}] Stage 3 — generating project files", traceId);
+        // INPUT:  ApiContract     (from Stage 1)
+        // OUTPUT: GeneratedProject (list of in-memory GeneratedFile objects)
+        //
+        // What RestAssuredProjectGenerator does internally:
+        //   1. Renders pom.xml         using pom.mustache template
+        //   2. Renders testng.xml      using testng.mustache template
+        //   3. Renders BaseTest.java   using basetest.mustache template
+        //   4. For each object schema  → renders a POJO using pojo.mustache
+        //   5. Groups endpoints by first path segment (e.g. /pets → "pets")
+        //   6. For each group          → renders a test class using testclass.mustache
+        //   7. Collects all GeneratedFile objects into a GeneratedProject
+        //
+        // If a .mustache file is missing or broken → TemplateRenderException (HTTP 500)
+        // If no files were produced                 → ProjectGenerationException (HTTP 500)
+        // ═════════════════════════════════════════════════════════════════════
+
+        log.info("[traceId={}] ─── Stage 2: Generating project files ───", traceId);
+
         GeneratedProject generatedProject = projectGenerator.generate(contract, traceId);
-        log.info("[traceId={}] Stage 3 complete | {}", traceId, generatedProject);
 
-        // ── Stage 4: Package all generated files into a ZIP archive ───────────────
+        //  generatedProject now contains:
+        //  ┌─────────────────────────────────────────────────────────────────┐
+        //  │  generatedProject.getProjectName()  "pet-store-api-tests"       │
+        //  │  generatedProject.getFileCount()    6 (or however many produced) │
+        //  │  generatedProject.getFiles()        [                            │
+        //  │    GeneratedFile("pom.xml",         "<?xml version=..."),        │
+        //  │    GeneratedFile("testng.xml",       "<!DOCTYPE..."),             │
+        //  │    GeneratedFile("src/test/.../BaseTest.java", "package..."),     │
+        //  │    GeneratedFile("src/test/.../Pet.java",      "package..."),     │
+        //  │    GeneratedFile("src/test/.../PetsApiTest.java","package..."),   │
+        //  │  ]                                                               │
+        //  └─────────────────────────────────────────────────────────────────┘
+        log.info("[traceId={}] ─── Stage 2 DONE | {}", traceId, generatedProject);
+
+
+        // ═════════════════════════════════════════════════════════════════════
+        // STAGE 3 — ZIP
         //
-        // ZipUtility writes each GeneratedFile into a ZipOutputStream in memory
-        // and returns the complete ZIP as a byte[].
-        log.info("[traceId={}] Stage 4 — packaging project into ZIP", traceId);
+        // INPUT:  GeneratedProject  (list of GeneratedFile objects from Stage 2)
+        // OUTPUT: byte[]            (complete ZIP archive, entirely in memory)
+        //
+        // What ZipUtility does internally:
+        //   1. Creates a ByteArrayOutputStream (no disk writes)
+        //   2. Wraps it in a ZipOutputStream with DEFLATED compression
+        //   3. For each GeneratedFile:
+        //      a. Creates a ZipEntry named "{projectName}/{file.relativePath}"
+        //      b. Writes the file content bytes (UTF-8) into the entry
+        //      c. Closes the entry
+        //   4. Closes the ZipOutputStream (writes the ZIP central directory)
+        //   5. Returns byteStream.toByteArray()
+        //
+        // ZIP structure produced:
+        //   pet-store-api-tests/
+        //   ├── pom.xml
+        //   ├── testng.xml
+        //   └── src/test/java/com/automation/tests/
+        //       ├── base/BaseTest.java
+        //       ├── model/Pet.java
+        //       └── tests/PetsApiTest.java
+        //
+        // If the ZipOutputStream throws IOException → ProjectGenerationException (HTTP 500)
+        // ═════════════════════════════════════════════════════════════════════
+
+        log.info("[traceId={}] ─── Stage 3: Packaging into ZIP ───", traceId);
+
         byte[] zipBytes = zipUtility.zip(generatedProject, traceId);
 
-        log.info("[traceId={}] GenerateAutomationProjectService.execute() complete | zip size={} bytes",
-                traceId, zipBytes.length);
+        log.info("[traceId={}] ═══ Pipeline DONE | zipSize={} bytes | files={} ═══",
+                traceId, zipBytes.length, generatedProject.getFileCount());
 
+        // Hand the raw ZIP bytes back to the controller.
+        // The controller sets:
+        //   Content-Disposition: attachment; filename="pet-store-api-tests.zip"
+        //   Content-Type: application/zip
+        //   Content-Length: {zipBytes.length}
         return zipBytes;
     }
 }
