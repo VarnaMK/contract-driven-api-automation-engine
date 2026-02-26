@@ -4,6 +4,9 @@ import com.varna.automationengine.application.usecase.GenerateAutomationProjectU
 import com.varna.automationengine.domain.exception.ContractParseException;
 import com.varna.automationengine.domain.exception.ProjectGenerationException;
 import com.varna.automationengine.domain.model.contract.ApiContract;
+import com.varna.automationengine.domain.model.project.GeneratedProject;
+import com.varna.automationengine.infrastructure.generator.ProjectGenerator;
+import com.varna.automationengine.infrastructure.generator.ZipUtility;
 import com.varna.automationengine.infrastructure.parser.OpenApiParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -68,14 +71,9 @@ public class GenerateAutomationProjectService implements GenerateAutomationProje
     // Spring will inject the correct implementation at runtime automatically.
     // ─────────────────────────────────────────────────────────────────────────
 
-    // TODO: Uncomment when com.varna.automationengine.domain.port.outbound.ContractParserPort is created
     private final OpenApiParser contractParser;
-
-    // TODO: Uncomment when com.varna.automationengine.domain.port.outbound.ProjectGeneratorPort is created
-    // private final ProjectGeneratorPort projectGenerator;
-
-    // TODO: Uncomment when com.varna.automationengine.domain.port.outbound.ArchivePort is created
-    // private final ArchivePort archivePort;
+    private final ProjectGenerator projectGenerator;
+    private final ZipUtility zipUtility;
 
     /**
      * Constructor injection — the only constructor in this class.
@@ -96,20 +94,13 @@ public class GenerateAutomationProjectService implements GenerateAutomationProje
      * annotation is required on the constructor (Spring Boot 2.x and above).
      *
      * <p>TODO: As port interfaces are added, include them as parameters here.
-     * Example of what the constructor will look like when all ports exist:
-     * <pre>
-     * public GenerateAutomationProjectService(
-     *         OpenApiParser contractParser,
-     *         ProjectGeneratorPort projectGenerator,
-     *         ArchivePort archivePort) {
-     *     this.contractParser   = contractParser;
-     *     this.projectGenerator = projectGenerator;
-     *     this.archivePort      = archivePort;
-     * }
-     * </pre>
      */
-    public GenerateAutomationProjectService(OpenApiParser contractParser) {
-        this.contractParser = contractParser;
+    public GenerateAutomationProjectService(OpenApiParser contractParser,
+                                            ProjectGenerator projectGenerator,
+                                            ZipUtility zipUtility) {
+        this.contractParser   = contractParser;
+        this.projectGenerator = projectGenerator;
+        this.zipUtility       = zipUtility;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -153,134 +144,25 @@ public class GenerateAutomationProjectService implements GenerateAutomationProje
 
         log.info("[traceId={}] Contract parsed successfully | {}", traceId, contract);
 
-        // ── Stage 3: Generate project files from the parsed contract ──────────────
+        // ── Stage 3: Generate all project source files from the parsed contract ─────
         //
-        // TODO: Replace this stub with a real call to ProjectGeneratorPort once
-        //       the following classes are created:
-        //         - com.varna.automationengine.domain.port.outbound.ProjectGeneratorPort
-        //         - com.varna.automationengine.infrastructure.generator.ProjectGeneratorAdapter
-        //         - com.varna.automationengine.generator.assembler.ProjectAssembler
-        //         - com.varna.automationengine.generator.strategy.* (all strategies)
-        //
-        // Real call will look like:
-        //   GeneratedProject project = projectGenerator.generate(contract, traceId);
-        //
-        log.info("[traceId={}] Stage 3 — project generation (STUBBED)", traceId);
-        Object generatedProject = generateProject(contract, traceId); // stub — replace with GeneratedProject
+        // RestAssuredProjectGenerator fans out to produce pom.xml, testng.xml,
+        // BaseTest.java, POJO classes, and one test class per resource group.
+        // Throws ProjectGenerationException if generation fails.
+        log.info("[traceId={}] Stage 3 — generating project files", traceId);
+        GeneratedProject generatedProject = projectGenerator.generate(contract, traceId);
+        log.info("[traceId={}] Stage 3 complete | {}", traceId, generatedProject);
 
-        log.debug("[traceId={}] Stage 3 complete — project generated (stub)", traceId);
-
-        // ── Stage 4: Archive all generated files into a ZIP byte array ────────────
+        // ── Stage 4: Package all generated files into a ZIP archive ───────────────
         //
-        // TODO: Replace this stub with a real call to ArchivePort once
-        //       the following classes are created:
-        //         - com.varna.automationengine.domain.port.outbound.ArchivePort
-        //         - com.varna.automationengine.infrastructure.archive.ZipArchiveAdapter
-        //
-        // What this stage will do when implemented:
-        //   - Iterate over all GeneratedFile objects in the GeneratedProject
-        //   - Write each file into a ZipOutputStream with its relative path preserved
-        //     (so the unzipped folder has the correct Maven project structure)
-        //   - Return the completed ZIP as a byte[]
-        //   - Throw ProjectGenerationException if the ZIP stream fails
-        //
-        // Real call will look like:
-        //   byte[] zipBytes = archivePort.zip(generatedProject, traceId);
-        //
-        log.info("[traceId={}] Stage 4 — project archiving (STUBBED)", traceId);
-        byte[] zipBytes = archiveProject(generatedProject, traceId); // returns stub bytes
+        // ZipUtility writes each GeneratedFile into a ZipOutputStream in memory
+        // and returns the complete ZIP as a byte[].
+        log.info("[traceId={}] Stage 4 — packaging project into ZIP", traceId);
+        byte[] zipBytes = zipUtility.zip(generatedProject, traceId);
 
         log.info("[traceId={}] GenerateAutomationProjectService.execute() complete | zip size={} bytes",
                 traceId, zipBytes.length);
 
         return zipBytes;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // PRIVATE PIPELINE METHODS
-    //
-    // Each private method below maps to one stage in the pipeline.
-    // They are extracted into separate methods for three reasons:
-    //   1. Readability — execute() reads like a clear sequence of steps
-    //   2. Focused error handling — each stage's errors are caught and
-    //      re-thrown with context in one place
-    //   3. Easy replacement — when real implementations are ready, you
-    //      replace the body of one method without touching the others
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Stage 1 — Reads the raw bytes from the uploaded {@link MultipartFile}.
-     *
-     * <p>Extracting bytes here decouples downstream stages from Spring's
-     * {@code MultipartFile} type. The parser and generator deal with plain
-     * Java types ({@code byte[]}, {@code String}), not Spring abstractions.
-     *
-     * @param contractFile the uploaded file from the HTTP request
-     * @param traceId      the request trace ID for log correlation
-     * @return the file's raw bytes
-     * @throws ContractParseException if the file bytes cannot be read (I/O error)
-     */
-     //} ->deleted by Varna
-
-
-    /**
-     * Stage 3 — Generates all project source files from the parsed contract.
-     *
-     * <p><b>Current state: STUB.</b><br>
-     * Returns a placeholder {@code Object} until {@code ProjectGeneratorPort}
-     * and the generator infrastructure are created.
-     *
-     * <p>TODO: Replace parameter type with {@code ApiContract}, return type with
-     * {@code GeneratedProject}, and delegate to {@code projectGenerator.generate(...)}
-     * once the following exist:
-     * <ul>
-     *   <li>{@code com.varna.automationengine.domain.model.project.GeneratedProject}</li>
-     *   <li>{@code com.varna.automationengine.domain.port.outbound.ProjectGeneratorPort}</li>
-     *   <li>{@code com.varna.automationengine.infrastructure.generator.ProjectGeneratorAdapter}</li>
-     * </ul>
-     *
-     * @param contract parsed contract domain model (currently {@code Object} stub)
-     * @param traceId  the request trace ID for log correlation
-     * @return stub placeholder (will return {@code GeneratedProject} when implemented)
-     */
-    private Object generateProject(ApiContract contract, String traceId) {
-        // ── STUB ─────────────────────────────────────────────────────────────
-        // TODO: Remove this stub and implement real generation when ProjectGeneratorPort exists.
-        //
-        // Real implementation:
-        //   return projectGenerator.generate((ApiContract) contract, traceId);
-        // ─────────────────────────────────────────────────────────────────────
-        log.warn("[traceId={}] generateProject() is a STUB — returning placeholder object", traceId);
-        return new Object(); // placeholder — replace with GeneratedProject
-    }
-
-    /**
-     * Stage 4 — Packages all generated files into a ZIP archive.
-     *
-     * <p><b>Current state: STUB.</b><br>
-     * Returns a hardcoded empty byte array until {@code ArchivePort} and
-     * {@code ZipArchiveAdapter} are created.
-     *
-     * <p>TODO: Replace parameter type with {@code GeneratedProject} and delegate
-     * to {@code archivePort.zip(...)} once the following exist:
-     * <ul>
-     *   <li>{@code com.varna.automationengine.domain.port.outbound.ArchivePort}</li>
-     *   <li>{@code com.varna.automationengine.infrastructure.archive.ZipArchiveAdapter}</li>
-     * </ul>
-     *
-     * @param generatedProject the assembled project (currently {@code Object} stub)
-     * @param traceId          the request trace ID for log correlation
-     * @return stub empty byte array (will return real ZIP bytes when implemented)
-     * @throws ProjectGenerationException if archiving fails
-     */
-    private byte[] archiveProject(Object generatedProject, String traceId) {
-        // ── STUB ─────────────────────────────────────────────────────────────
-        // TODO: Remove this stub and implement real archiving when ArchivePort exists.
-        //
-        // Real implementation:
-        //   return archivePort.zip((GeneratedProject) generatedProject, traceId);
-        // ─────────────────────────────────────────────────────────────────────
-        log.warn("[traceId={}] archiveProject() is a STUB — returning empty byte array", traceId);
-        return new byte[0]; // placeholder — replace with real ZIP bytes
     }
 }
